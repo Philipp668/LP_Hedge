@@ -1,0 +1,249 @@
+import time
+import math
+import json
+import requests
+from web3 import Web3
+from eth_account import Account
+from hyperliquid.exchange import Exchange
+from hyperliquid.info import Info
+
+SONIC_RPC = "https://rpc.ankr.com/sonic_mainnet"
+web3 = Web3(Web3.HTTPProvider(SONIC_RPC))
+
+POOL_ADDRESS = web3.to_checksum_address("0xa1538e790ccdd639755602857f582a39ed7f650c")
+NFT_CONTRACT_ADDRESS = web3.to_checksum_address("0x12e66c8f215ddd5d48d150c8f46ad0c6fb0f4406")
+WALLET = web3.to_checksum_address("0x056000BA3e844810cdd86A69F104e2c91203BE82")
+
+# Hyperliquid config
+with open("config.json") as f:
+    config = json.load(f)
+account_address = config["account_address"]
+secret_key = config["secret_key"]
+wallet = Account.from_key(secret_key)
+base_url = "https://api.hyperliquid.xyz"
+exchange = Exchange(wallet, base_url=base_url, account_address=account_address)
+info = Info(base_url=base_url)
+
+# Pool and NFT ABIs (minimal for this use case)
+POOL_ABI = [
+    {"inputs": [], "name": "token0", "outputs": [{"internalType": "address", "name": "", "type": "address"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "token1", "outputs": [{"internalType": "address", "name": "", "type": "address"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "slot0", "outputs": [
+        {"internalType": "uint160", "name": "sqrtPriceX96", "type": "uint160"},
+        {"internalType": "int24", "name": "tick", "type": "int24"},
+        {"internalType": "uint16", "name": "observationIndex", "type": "uint16"},
+        {"internalType": "uint16", "name": "observationCardinality", "type": "uint16"},
+        {"internalType": "uint16", "name": "observationCardinalityNext", "type": "uint16"},
+        {"internalType": "uint8", "name": "feeProtocol", "type": "uint8"},
+        {"internalType": "bool", "name": "unlocked", "type": "bool"}
+    ], "stateMutability": "view", "type": "function"}
+]
+NFT_ABI = [
+    {"inputs":[{"internalType":"uint256","name":"tokenId","type":"uint256"}],"name":"positions","outputs":[{"internalType":"address","name":"token0","type":"address"},{"internalType":"address","name":"token1","type":"address"},{"internalType":"int24","name":"tickSpacing","type":"int24"},{"internalType":"int24","name":"tickLower","type":"int24"},{"internalType":"int24","name":"tickUpper","type":"int24"},{"internalType":"uint128","name":"liquidity","type":"uint128"},{"internalType":"uint256","name":"feeGrowthInside0LastX128","type":"uint256"},{"internalType":"uint256","name":"feeGrowthInside1LastX128","type":"uint256"},{"internalType":"uint128","name":"tokensOwed0","type":"uint128"},{"internalType":"uint128","name":"tokensOwed1","type":"uint128"}],"stateMutability":"view","type":"function"},
+    {"constant": True, "inputs": [{"name": "owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
+    {"constant": True, "inputs": [{"name": "owner", "type": "address"}, {"name": "index", "type": "uint256"}], "name": "tokenOfOwnerByIndex", "outputs": [{"name": "tokenId", "type": "uint256"}], "type": "function"}
+]
+ERC20_ABI = [
+    {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"}
+]
+
+def get_token_info(token_address):
+    token_contract = web3.eth.contract(address=token_address, abi=ERC20_ABI)
+    try:
+        symbol = token_contract.functions.symbol().call()
+    except Exception:
+        symbol = token_address
+    try:
+        decimals = token_contract.functions.decimals().call()
+    except Exception:
+        decimals = 18
+    return symbol, decimals
+
+def tick_to_sqrt_price(tick):
+    return math.pow(1.0001, tick / 2)
+
+def get_amounts_from_liquidity(liquidity, tickLower, tickUpper, currentTick, decimals0, decimals1):
+    sqrtLower = tick_to_sqrt_price(tickLower)
+    sqrtUpper = tick_to_sqrt_price(tickUpper)
+    sqrtCurrent = tick_to_sqrt_price(currentTick)
+    liquidity = float(liquidity)
+    if currentTick <= tickLower:
+        amount0 = liquidity * (sqrtUpper - sqrtLower) / (sqrtUpper * sqrtLower)
+        amount1 = 0
+    elif currentTick >= tickUpper:
+        amount0 = 0
+        amount1 = liquidity * (sqrtUpper - sqrtLower)
+    else:
+        amount0 = liquidity * (sqrtUpper - sqrtCurrent) / (sqrtUpper * sqrtCurrent)
+        amount1 = liquidity * (sqrtCurrent - sqrtLower)
+    amount0 /= 10 ** decimals0
+    amount1 /= 10 ** decimals1
+    return amount0, amount1
+
+def get_coingecko_price(symbol):
+    # Map symbol to Coingecko ID
+    coingecko_ids = {"wS": "wrapped-sonic", "WBTC": "wrapped-bitcoin"}
+    if symbol not in coingecko_ids:
+        return None
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coingecko_ids[symbol]}&vs_currencies=usd"
+    try:
+        resp = requests.get(url)
+        data = resp.json()
+        price = float(data[coingecko_ids[symbol]]['usd'])
+        print(f"Got price for {symbol}: ${price:.6f}")  # Debug print
+        return price
+    except Exception as e:
+        print(f"Error fetching price from Coingecko: {e}")
+        return None
+
+def open_hyperliquid_position(asset, is_long, size_in_asset, reference_usd_value=None):
+    symbol_map = {"WBTC": "BTC", "wS": "S"}
+    name = symbol_map.get(asset, asset)
+    mids = info.all_mids()
+    mid = float(mids[name])
+
+    if name == "S":
+        # For Sonic, size is the integer number of tokens.
+        size = int(size_in_asset)
+        usd_value = reference_usd_value if reference_usd_value is not None else size * mid
+    else:
+        # For other assets like BTC, we derive size from a reference USD value.
+        if reference_usd_value is None:
+            print("Error: reference_usd_value must be provided for non-S assets")
+            return False, 0
+        usd_value = reference_usd_value
+        size = round(usd_value / mid, 5)
+
+    if usd_value < 10:
+        print(f"Order not placed: Notional value ${usd_value:.2f} is below Hyperliquid minimum of $10.")
+        return False, 0
+        
+    print(f"Opening {name} position:")
+    print(f"  Direction: {'LONG' if is_long else 'SHORT'}")
+    print(f"  USD Value: ${usd_value:.2f}")
+    print(f"  Mid Price: ${mid:.2f}")
+    print(f"  Size: {size}")
+    
+    try:
+        result = exchange.market_open(name=name, is_buy=is_long, sz=size, slippage=0.05)
+        print(f"Order result: {result}")
+        
+        # Check for errors in the response
+        if result.get('status') == 'ok':
+            statuses = result.get('response', {}).get('data', {}).get('statuses', [])
+            if statuses and 'error' in statuses[0]:
+                print(f"Failed to open position: {statuses[0]['error']}")
+                return False, 0
+            elif statuses and 'filled' in statuses[0]:
+                print(f"Successfully opened {'LONG' if is_long else 'SHORT'} {name} for ${usd_value:.2f} (size: {size})")
+                return True, usd_value
+            else:
+                print(f"Unexpected response format: {result}")
+                return False, 0
+        else:
+            print(f"Failed to open position: {result}")
+            return False, 0
+    except Exception as e:
+        print(f"Error placing order: {str(e)}")
+        return False, 0
+
+def close_hyperliquid_position(asset, is_long):
+    # asset: "BTC" or "wS" (map to Hyperliquid symbol)
+    symbol_map = {"WBTC": "BTC", "wS": "S"}
+    name = symbol_map.get(asset, asset)
+    # Close all positions for this asset
+    # For simplicity, use market_close
+    print(f"Attempting to close {'LONG' if is_long else 'SHORT'} position for {name}...")
+    try:
+        result = exchange.market_close(coin=name)
+        print(f"Close order result for {name}: {result}")
+        if result.get('status') == 'ok':
+            print(f"Successfully closed position for {name}")
+        else:
+            print(f"Failed to close position for {name}: {result}")
+    except Exception as e:
+        print(f"Error closing position for {name}: {str(e)}")
+
+def orchestrate():
+    pool = web3.eth.contract(address=POOL_ADDRESS, abi=POOL_ABI)
+    nft_contract = web3.eth.contract(address=NFT_CONTRACT_ADDRESS, abi=NFT_ABI)
+    token0_addr = pool.functions.token0().call()
+    token1_addr = pool.functions.token1().call()
+    symbol0, decimals0 = get_token_info(token0_addr)
+    symbol1, decimals1 = get_token_info(token1_addr)
+    print(f"Orchestrator started. Tracking wallet LP tokens in pool: {POOL_ADDRESS}")
+    print(f"Wallet: {WALLET}")
+    print(f"Token0: {symbol0} ({token0_addr})")
+    print(f"Token1: {symbol1} ({token1_addr})")
+    print(f"Update interval: 5 seconds\n")
+    in_hedge = False
+    last_zero = None
+    try:
+        while True:
+            slot0 = pool.functions.slot0().call()
+            currentTick = slot0[1]
+            balance = nft_contract.functions.balanceOf(WALLET).call()
+            token_ids = []
+            for i in range(balance):
+                token_id = nft_contract.functions.tokenOfOwnerByIndex(WALLET, i).call()
+                token_ids.append(token_id)
+            total0 = 0
+            total1 = 0
+            for token_id in token_ids:
+                try:
+                    pos = nft_contract.functions.positions(token_id).call()
+                    if (web3.to_checksum_address(pos[0]) == token0_addr and web3.to_checksum_address(pos[1]) == token1_addr):
+                        tickLower = pos[3]
+                        tickUpper = pos[4]
+                        liquidity = pos[5]
+                        amount0, amount1 = get_amounts_from_liquidity(liquidity, tickLower, tickUpper, currentTick, decimals0, decimals1)
+                        total0 += amount0
+                        total1 += amount1
+                except Exception as e:
+                    print(f"  Error fetching position for token {token_id}: {e}")
+            print(f"[{time.strftime('%H:%M:%S')}] {symbol0}: {total0:.8f}, {symbol1}: {total1:.8f}")
+            # Step 2: If one token is 0, open/close positions
+            if not in_hedge and ((total0 == 0 and total1 > 0) or (total1 == 0 and total0 > 0)):
+                # Out of range
+                if total0 == 0 and total1 > 0: # We are left with token1
+                    # Short the asset we have (token1)
+                    hedge_opened, usd_value = open_hyperliquid_position(symbol1, False, total1)
+                    if hedge_opened:
+                        # Long the other asset for the same USD value
+                        second_hedge_opened, _ = open_hyperliquid_position(symbol0, True, 0, reference_usd_value=usd_value)
+                        if second_hedge_opened:
+                            last_zero = 0
+                            in_hedge = True
+                        else:
+                            close_hyperliquid_position(symbol1, False)
+                elif total1 == 0 and total0 > 0: # We are left with token0
+                    # Short the asset we have (token0)
+                    hedge_opened, usd_value = open_hyperliquid_position(symbol0, False, total0)
+                    if hedge_opened:
+                        # Long the other asset for the same USD value
+                        second_hedge_opened, _ = open_hyperliquid_position(symbol1, True, 0, reference_usd_value=usd_value)
+                        if second_hedge_opened:
+                            last_zero = 1
+                            in_hedge = True
+                        else:
+                            close_hyperliquid_position(symbol0, False)
+            # Step 3: If both tokens are nonzero again, close positions
+            elif in_hedge and (total0 > 0 and total1 > 0):
+                if last_zero == 0:
+                    close_hyperliquid_position(symbol0, True)
+                    close_hyperliquid_position(symbol1, False)
+                else:
+                    close_hyperliquid_position(symbol1, True)
+                    close_hyperliquid_position(symbol0, False)
+                in_hedge = False
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("\nStopped orchestrator.")
+
+if __name__ == "__main__":
+    orchestrate()
+
+# Instructions:
+# 1. Ensure config.json has your Hyperliquid credentials.
+# 2. Run: python lp_hedge_orchestrator.py 
